@@ -648,19 +648,36 @@ def vip_code4(text):
 #               إرسال الردود الذكي
 # ================================================================
 
+def reply_keyboard():
+    """أزرار ثابتة تحت كل رد"""
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("🗑 مسح الذاكرة", callback_data="clear_mem"),
+        InlineKeyboardButton("🔄 سؤال جديد",   callback_data="new_q"),
+    )
+    kb.row(
+        InlineKeyboardButton("📋 عرض الذاكرة", callback_data="show_mem"),
+        InlineKeyboardButton("⚙️ System",       callback_data="system"),
+    )
+    return kb
+
 def send_response(chat_id, res, reply_to_id=None):
     if not res or not res.strip():
         res = "⚠️ لم يتم الحصول على رد."
 
     cod = vip_code2(res)
 
+    # إرسال كملف كود
     if cod and len(res) > 1000:
         caption = vip_code4(cod["text"] or "").strip()
         if len(caption) > 1024:
             caption = caption[:1024]
         try:
             with open(cod["path"], "rb") as f:
-                kwargs = {"chat_id": chat_id, "document": f, "caption": caption}
+                kwargs = {
+                    "chat_id": chat_id, "document": f, "caption": caption,
+                    "reply_markup": reply_keyboard()
+                }
                 if vip_code3(caption):
                     kwargs["parse_mode"] = "Markdown"
                 if reply_to_id:
@@ -677,20 +694,27 @@ def send_response(chat_id, res, reply_to_id=None):
     res  = vip_code4(res)
     safe = res
 
+    # رسالة طويلة — قسّم، الأزرار على آخر جزء فقط
     if len(safe) > 4000:
         parts = [safe[i:i+4000] for i in range(0, len(safe), 4000)]
         for i, part in enumerate(parts):
-            part = vip_code4(part)
+            part  = vip_code4(part)
             kwargs = {"chat_id": chat_id, "text": part, "disable_web_page_preview": True}
             if reply_to_id and i == 0:
                 kwargs["reply_to_message_id"] = reply_to_id
+            if i == len(parts) - 1:
+                kwargs["reply_markup"] = reply_keyboard()
             bot.send_message(**kwargs)
         return False
 
+    # رسالة عادية
     if vip_code3(safe):
         try:
-            kwargs = {"chat_id": chat_id, "text": safe,
-                      "parse_mode": "Markdown", "disable_web_page_preview": True}
+            kwargs = {
+                "chat_id": chat_id, "text": safe,
+                "parse_mode": "Markdown", "disable_web_page_preview": True,
+                "reply_markup": reply_keyboard()
+            }
             if reply_to_id:
                 kwargs["reply_to_message_id"] = reply_to_id
             bot.send_message(**kwargs)
@@ -698,7 +722,11 @@ def send_response(chat_id, res, reply_to_id=None):
         except Exception:
             pass
 
-    kwargs = {"chat_id": chat_id, "text": res, "disable_web_page_preview": True}
+    kwargs = {
+        "chat_id": chat_id, "text": res,
+        "disable_web_page_preview": True,
+        "reply_markup": reply_keyboard()
+    }
     if reply_to_id:
         kwargs["reply_to_message_id"] = reply_to_id
     bot.send_message(**kwargs)
@@ -995,7 +1023,75 @@ def security_filter(text):
     return None  # مفيش مشكلة — كمّل عادي
 
 
-def is_code_request(text):
+def clean_code(code):
+    """
+    تنظيف شامل للكود من الماركداون — يحل مشكلة SyntaxError
+    """
+    if not code:
+        return code
+
+    text = code.strip()
+
+    # إزالة ```lang من البداية و ``` من النهاية (كل الأنماط)
+    # النمط: ```python\n...كود...\n```
+    pattern = r'^```[\w+\-#]*\s*\n?([\s\S]*?)\n?```\s*$'
+    m = re.match(pattern, text, re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+
+    # لو في أكتر من بلوك — خذ كل الكود بين أول وآخر ```
+    if text.count("```") >= 2:
+        parts = text.split("```")
+        # parts = ["", "python\nكود", "", "python\nكود2", ""]
+        code_parts = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:  # البلوكات الفردية هي الكود
+                # أزل اسم اللغة من أول سطر
+                lines = part.split("\n")
+                if lines and re.match(r'^[\w+\-#]*$', lines[0].strip()):
+                    lines = lines[1:]
+                code_parts.append("\n".join(lines).strip())
+        if code_parts:
+            return "\n\n# ==================\n\n".join(code_parts)
+
+    # لو ما فيهاش backticks — رجع كما هو
+    return text
+
+def is_ambiguous(text):
+    """
+    يكتشف لو الطلب غامض ومحتاج توضيح
+    """
+    t = text.strip()
+    words = t.split()
+
+    # قصير جداً (أقل من 3 كلمات) وليس سلام أو تحية
+    greetings = ["هلا","هلو","هاي","مرحبا","السلام","صباح","مساء","hi","hello","hey","سلام"]
+    if len(words) <= 2 and not any(g in t.lower() for g in greetings):
+        return True
+
+    # كلمات غامضة بدون سياق
+    vague = ["اعمل","انشئ","اكتب","جيب","هات","عمل","ابني","طور"]
+    if any(t.lower().startswith(v) for v in vague) and len(words) <= 3:
+        return True
+
+    return False
+
+def ask_clarification(chat_id, text, reply_to_id=None):
+    """
+    يسأل المستخدم عن التوضيح بذكاء
+    """
+    prompt = (
+        f"المستخدم أرسل هذا الطلب الغامض: '{text}'\n"
+        f"اطلب منه التوضيح بأسلوب ودود ومحدد — اسأله عن:\n"
+        f"1. ما الهدف بالضبط؟\n"
+        f"2. ما اللغة أو التقنية المطلوبة (إن كان برمجياً)؟\n"
+        f"3. أي تفاصيل إضافية تساعد في تنفيذ الطلب؟\n"
+        f"أجب بالعربية وبأسلوب محادثة طبيعي."
+    )
+    res = global_ai(chat_id, prompt)
+    send_response(chat_id, res, reply_to_id=reply_to_id)
+
+
     keywords = [
         "اكتب","كود","برمج","سكريبت","بوت","برنامج","كتابة","طور","انشئ","أنشئ","اعمل",
         "script","code","bot","program","write","create","develop","function","class","build"
@@ -1299,7 +1395,37 @@ def handle_callback(call: CallbackQuery):
         )
         bot.answer_callback_query(call.id, text=text, show_alert=True)
 
-    elif data == "search_info":
+    elif data == "clear_mem":
+        if memory_delete(chat_id):
+            bot.answer_callback_query(call.id, text="✅ تم مسح الذاكرة بنجاح!", show_alert=False)
+            try:
+                bot.edit_message_reply_markup(chat_id=chat_id, message_id=mid,
+                    reply_markup=reply_keyboard())
+            except Exception:
+                pass
+        else:
+            bot.answer_callback_query(call.id, text="الذاكرة فارغة أصلاً", show_alert=False)
+
+    elif data == "new_q":
+        bot.answer_callback_query(call.id, text="✍️ اكتب سؤالك الجديد", show_alert=False)
+        bot.send_message(chat_id, "✍️ اكتب سؤالك أو طلبك الجديد:")
+
+    elif data == "show_mem":
+        mem = memory_read(chat_id)
+        if not mem:
+            bot.answer_callback_query(call.id, text="الذاكرة فارغة حالياً", show_alert=True)
+            return
+        lines = [f"💾 الذاكرة ({len(mem)} رسالة)\n━━━━━━━━━━━━━━━━━━━━"]
+        for m in mem[-10:]:
+            role  = "👤" if m.get("role") == "user" else "🤖"
+            txt   = m.get("text","")[:80]
+            lines.append(f"{role} {txt}{'...' if len(m.get('text','')) > 80 else ''}")
+        summary = "\n".join(lines)
+        if len(summary) > 200:
+            summary = summary[:197] + "..."
+        bot.answer_callback_query(call.id, text=summary, show_alert=True)
+
+
         text = (
             "🔍 البحث في الويب:\n\n"
             "البوت يبحث تلقائياً عند سؤالك عن:\n"
@@ -1318,16 +1444,44 @@ def handle_callback(call: CallbackQuery):
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message: Message):
-    chat_id = message.chat.id
+    chat_id  = message.chat.id
+    register_user(chat_id, message.from_user.first_name, message.from_user.username or "")
+
+    if is_banned(chat_id):
+        bot.reply_to(message, "🚫 أنت محظور من استخدام البوت.")
+        return
+
     bot.send_chat_action(chat_id, "typing")
-    caption = message.caption or "حلل هذه الصورة واشرح ما تراه بالتفصيل"
+    caption = message.caption or "حلل هذه الصورة بالتفصيل واشرح كل ما تراه"
+
     try:
         fi  = bot.get_file(message.photo[-1].file_id)
         url = f"https://api.telegram.org/file/bot{TOKEN}/{fi.file_path}"
-        prompt = f"[المستخدم أرسل صورة من: {url}]\nالطلب: {caption}"
+
+        # حفظ الصورة في الذاكرة كسياق
+        img_context = f"[المستخدم أرسل صورة/سكرين شوت من: {url}]"
+        memory_add(chat_id, "user", f"{img_context}\nالطلب: {caption}")
+
+        # بناء الـ prompt مع سياق المحادثة السابقة
+        history = memory_read(chat_id)
+        context_str = ""
+        if len(history) > 1:
+            for m in history[-6:-1]:
+                label = "user" if m.get("role") == "user" else "assistant"
+                context_str += f"{label}: {m.get('text','')}\n\n"
+
+        prompt = (
+            f"{context_str}"
+            f"المستخدم أرسل صورة (سكرين شوت أو صورة عادية) من الرابط: {url}\n"
+            f"الطلب: {caption}\n\n"
+            f"قم بتحليل الصورة بدقة، وإذا كانت تحتوي على كود أو خطأ برمجي فاشرحه وقدّم الحل."
+        )
     except Exception:
         prompt = f"المستخدم أرسل صورة. الطلب: {caption}"
+
     res = global_ai(chat_id, prompt)
+    # حفظ رد البوت في الذاكرة
+    memory_add(chat_id, "assistant", res)
     send_response(chat_id, res, reply_to_id=message.message_id)
 
 # ================================================================
@@ -1434,6 +1588,11 @@ def handle_text(message: Message):
         send_response(chat_id, blocked, reply_to_id=message.message_id)
         return
 
+    # ── كشف الغموض ────────────────────────────────────────────────
+    if is_ambiguous(user_text):
+        ask_clarification(chat_id, user_text, reply_to_id=message.message_id)
+        return
+
     # طلب صورة
     img_kw = ["صور","ولد صورة","اعمل صورة","ارسم","generate image","draw"]
     if any(k in user_text.lower() for k in img_kw):
@@ -1455,14 +1614,7 @@ def handle_text(message: Message):
         code = generate_code(chat_id, user_text)
         if code and len(code) > 50:
             filename = detect_filename(user_text)
-            # تنظيف markdown
-            clean = code
-            for lang in ["python","javascript","js","html","css","php","bash",
-                         "sh","java","cpp","c","go","ts","sql","ruby"]:
-                clean = clean.replace(f"```{lang}", "```")
-            if "```" in clean:
-                parts = clean.split("```")
-                clean = parts[1].strip() if len(parts) >= 3 else clean.replace("```","").strip()
+            clean = clean_code(code)
             fp = tmp_path(filename)
             try:
                 with open(fp, "w", encoding="utf-8") as f:
